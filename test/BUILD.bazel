@@ -29,7 +29,6 @@ COPTS = [
     "-fPIC",
     "-Wno-unused-parameter",
     "-fno-omit-frame-pointer",
-    "-DGFLAGS_NS=google",
     "-fno-access-control",
     "-DBAZEL_TEST=1",
     "-DBVAR_NOT_LINK_DEFAULT_VARIABLES",
@@ -139,7 +138,8 @@ TEST_BUTIL_SOURCES = [
     #"popen_unittest.cpp",
     "bounded_queue_unittest.cc",
     "butil_unittest_main.cpp",
-    "scope_guard_unittest.cc",
+    "scope_guard_unittest.cpp",
+    "optional_unittest.cpp",
 ] + select({
     "@bazel_tools//tools/osx:darwin_x86_64": [],
     "//conditions:default": [

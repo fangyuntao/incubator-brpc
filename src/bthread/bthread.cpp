@@ -19,9 +19,12 @@
 
 // Date: Tue Jul 10 17:40:58 CST 2012
 
+#include <sys/syscall.h>
 #include <gflags/gflags.h>
 #include "butil/macros.h"                       // BAIDU_CASSERT
 #include "butil/logging.h"
+#include "butil/thread_local.h"
+#include "butil/reloadable_flags.h"
 #include "bthread/task_group.h"                // TaskGroup
 #include "bthread/task_control.h"              // TaskControl
 #include "bthread/timer_thread.h"
@@ -30,46 +33,33 @@
 
 namespace bthread {
 
-DEFINE_int32(bthread_concurrency, 8 + BTHREAD_EPOLL_THREAD_NUM,
-             "Number of pthread workers");
-
-DEFINE_int32(bthread_min_concurrency, 0,
-            "Initial number of pthread workers which will be added on-demand."
-            " The laziness is disabled when this value is non-positive,"
-            " and workers will be created eagerly according to -bthread_concurrency and bthread_setconcurrency(). ");
-
-DEFINE_int32(bthread_current_tag, BTHREAD_TAG_INVALID, "Set bthread concurrency for this tag");
-
-DEFINE_int32(bthread_concurrency_by_tag, 8 + BTHREAD_EPOLL_THREAD_NUM,
-             "Number of pthread workers of FLAGS_bthread_current_tag");
-
-static bool never_set_bthread_concurrency = true;
-
 static bool validate_bthread_concurrency(const char*, int32_t val) {
     // bthread_setconcurrency sets the flag on success path which should
     // not be strictly in a validator. But it's OK for a int flag.
     return bthread_setconcurrency(val) == 0;
 }
-const int ALLOW_UNUSED register_FLAGS_bthread_concurrency = 
-    ::GFLAGS_NS::RegisterFlagValidator(&FLAGS_bthread_concurrency,
-                                    validate_bthread_concurrency);
-
 static bool validate_bthread_min_concurrency(const char*, int32_t val);
-
-const int ALLOW_UNUSED register_FLAGS_bthread_min_concurrency =
-    ::GFLAGS_NS::RegisterFlagValidator(&FLAGS_bthread_min_concurrency,
-                                    validate_bthread_min_concurrency);
-
 static bool validate_bthread_current_tag(const char*, int32_t val);
-
-const int ALLOW_UNUSED register_FLAGS_bthread_current_tag =
-    ::GFLAGS_NS::RegisterFlagValidator(&FLAGS_bthread_current_tag, validate_bthread_current_tag);
-
 static bool validate_bthread_concurrency_by_tag(const char*, int32_t val);
 
-const int ALLOW_UNUSED register_FLAGS_bthread_concurrency_by_tag =
-    ::GFLAGS_NS::RegisterFlagValidator(&FLAGS_bthread_concurrency_by_tag,
-                                       validate_bthread_concurrency_by_tag);
+DEFINE_int32(bthread_concurrency, 8 + BTHREAD_EPOLL_THREAD_NUM,
+             "Number of pthread workers");
+BUTIL_VALIDATE_GFLAG(bthread_concurrency, validate_bthread_concurrency);
+
+DEFINE_int32(bthread_min_concurrency, 0,
+            "Initial number of pthread workers which will be added on-demand."
+            " The laziness is disabled when this value is non-positive,"
+            " and workers will be created eagerly according to -bthread_concurrency and bthread_setconcurrency(). ");
+BUTIL_VALIDATE_GFLAG(bthread_min_concurrency, validate_bthread_min_concurrency);
+
+DEFINE_int32(bthread_current_tag, BTHREAD_TAG_INVALID, "Set bthread concurrency for this tag");
+BUTIL_VALIDATE_GFLAG(bthread_current_tag, validate_bthread_current_tag);
+
+DEFINE_int32(bthread_concurrency_by_tag, 8 + BTHREAD_EPOLL_THREAD_NUM,
+             "Number of pthread workers of FLAGS_bthread_current_tag");
+BUTIL_VALIDATE_GFLAG(bthread_concurrency_by_tag, validate_bthread_concurrency_by_tag);
+
+static bool never_set_bthread_concurrency = true;
 
 BAIDU_CASSERT(sizeof(TaskControl*) == sizeof(butil::atomic<TaskControl*>), atomic_size_match);
 
@@ -114,6 +104,79 @@ inline TaskControl* get_or_new_task_control() {
     p->store(c, butil::memory_order_release);
     return c;
 }
+
+#ifdef BRPC_BTHREAD_TRACER
+BAIDU_THREAD_LOCAL TaskMeta* pthread_fake_meta = NULL;
+
+bthread_t init_for_pthread_stack_trace() {
+    if (NULL != pthread_fake_meta) {
+        return pthread_fake_meta->tid;
+    }
+
+    TaskControl* c = get_task_control();
+    if (NULL == c) {
+        LOG(ERROR) << "TaskControl has not been created, "
+                      "please use bthread_start_xxx before call this function";
+        return INVALID_BTHREAD;
+    }
+
+    butil::ResourceId<TaskMeta> slot;
+    pthread_fake_meta = butil::get_resource(&slot);
+    if (BAIDU_UNLIKELY(NULL == pthread_fake_meta)) {
+        LOG(ERROR) << "Fail to get TaskMeta";
+        return INVALID_BTHREAD;
+    }
+
+    pthread_fake_meta->attr = BTHREAD_ATTR_PTHREAD;
+    pthread_fake_meta->tid = make_tid(*pthread_fake_meta->version_butex, slot);
+    // Make TaskTracer use signal trace mode for pthread.
+    c->_task_tracer.set_running_status(syscall(SYS_gettid), pthread_fake_meta);
+
+    // Release the TaskMeta at exit of pthread.
+    butil::thread_atexit([]() {
+        // Similar to TaskGroup::task_runner.
+        bool tracing;
+        {
+            BAIDU_SCOPED_LOCK(pthread_fake_meta->version_lock);
+            tracing = TaskTracer::set_end_status_unsafe(pthread_fake_meta);
+            // If resulting version is 0,
+            // change it to 1 to make bthread_t never be 0.
+            if (0 == ++*pthread_fake_meta->version_butex) {
+                ++*pthread_fake_meta->version_butex;
+            }
+        }
+
+        if (tracing) {
+            // Wait for tracing completion.
+            get_task_control()->_task_tracer.WaitForTracing(pthread_fake_meta);
+        }
+        get_task_control()->_task_tracer.set_status(
+            TASK_STATUS_UNKNOWN, pthread_fake_meta);
+
+        butil::return_resource(get_slot(pthread_fake_meta->tid));
+        pthread_fake_meta = NULL;
+    });
+
+    return pthread_fake_meta->tid;
+}
+
+void stack_trace(std::ostream& os, bthread_t tid) {
+    TaskControl* c = get_task_control();
+    if (NULL == c) {
+        os << "TaskControl has not been created";
+        return;
+    }
+    c->stack_trace(os, tid);
+}
+
+std::string stack_trace(bthread_t tid) {
+    TaskControl* c = get_task_control();
+    if (NULL == c) {
+        return "TaskControl has not been created";
+    }
+    return c->stack_trace(tid);
+}
+#endif // BRPC_BTHREAD_TRACER
 
 static int add_workers_for_each_tag(int num) {
     int added = 0;
@@ -552,6 +615,14 @@ int bthread_list_join(bthread_list_t* list) {
 bthread_tag_t bthread_self_tag(void) {
     return bthread::tls_task_group != nullptr ? bthread::tls_task_group->tag()
                                               : BTHREAD_TAG_DEFAULT;
+}
+
+uint64_t bthread_cpu_clock_ns(void) {
+     bthread::TaskGroup* g = bthread::tls_task_group;
+    if (g != NULL && !g->is_current_main_task()) {
+        return g->current_task_cpu_clock_ns();
+    }
+    return 0;
 }
 
 }  // extern "C"
